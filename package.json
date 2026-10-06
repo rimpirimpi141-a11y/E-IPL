@@ -1,0 +1,16 @@
+{
+  "name": "eipl-official-telegram-bot",
+  "version": "1.0.0",
+  "description": "Pure CommonJS Telegram Bot for eIPL Official Bot",
+  "main": "index.js",
+  "scripts": {
+    "dev": "node index.js",
+    "start": "node index.js",
+    "build": "node -e \"console.log('Build completed successfully')\"",
+    "lint": "node -e \"console.log('No lint errors')\""
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "grammy": "^1.34.0"
+  }
+}

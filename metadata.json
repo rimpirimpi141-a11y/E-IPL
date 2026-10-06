@@ -1,0 +1,6 @@
+{
+  "name": "eIPL Official Bot",
+  "description": "Telegram automation bot for eIPL with dynamic force channel join, referral reward system, daily check-in, promo code redemption, and admin control panel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
