@@ -1,6 +1,6 @@
 {
   "name": "eIPL Official Bot",
-  "description": "Telegram automation bot for eIPL with dynamic force channel join, referral reward system, daily check-in, promo code redemption, and admin control panel.",
+  "description": "Telegram automation bot for eIPL with Firebase Realtime Database persistence, Cash Refer & Payout dashboard, 31 restored user records, 5 active promo codes, Spin & Win, and admin payout management panel.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -9,6 +9,33 @@ const { Bot, InlineKeyboard, Keyboard, InputFile } = require("grammy");
 const http = require("http");
 require("dotenv").config();
 
+const {
+  initFirebase,
+  getDb,
+  isFirebaseReady,
+  normalizeUserRecord,
+  getUser,
+  saveUser,
+  updateUser,
+  updateUserPoints,
+  getAllUsers,
+  seedUsersIfEmpty,
+  subscribeToUsers,
+  getAllPromoCodes,
+  seedPromoCodesIfEmpty,
+  savePromoCode,
+  recordPromoCodeRedemption,
+  subscribeToPromoCodes,
+  savePayoutRequest,
+  updatePayoutRequest,
+  getAllPayoutRequests,
+  subscribeToPayoutRequests,
+  updateUserReferralCash,
+  DEFAULT_PROMO_CODES,
+  SEED_USERS,
+  DATABASE_URL
+} = require("./firebaseConfig");
+
 // ==========================================
 // 1. CONFIGURATION & SECRETS
 // ==========================================
@@ -62,11 +89,123 @@ function getInitial(str) {
 }
 
 // ==========================================
-// 2. IN-MEMORY STORAGE & CACHE
+// 2. IN-MEMORY STORAGE & FIREBASE RTDB SYNC
 // ==========================================
 // userId -> { id, firstName, lastName, username, points, referrerId, isVerified, joinedAt, joinedTimestamp, lastCheckin, lastSpin, referralsCount }
 const users = new Map();
 const verifiedUsers = new Set(); // Persistent cache of verified user IDs
+const payoutRequests = new Map(); // requestId -> { requestId, userId, userName, amount, refersCount, paymentDetails, status, timestamp }
+
+// Immediately preload all 31 restored user records into memory to prevent memory wipe issues
+for (const [uid, record] of Object.entries(SEED_USERS)) {
+  const norm = normalizeUserRecord(uid, record);
+  users.set(String(uid), norm);
+  if (norm.isVerified || norm.verified) {
+    verifiedUsers.add(String(uid));
+  }
+}
+console.log(`[Storage] Initialized with ${users.size} verified user records from CSV seed.`);
+
+// Bootstrap Firebase Realtime Database asynchronously
+(async () => {
+  try {
+    initFirebase();
+    if (isFirebaseReady()) {
+      // 1. Automatic CSV data seeding to Firebase if empty or missing records
+      const seedResult = await seedUsersIfEmpty(SEED_USERS);
+      console.log(`[Firebase RTDB Boot] Seed status: ${seedResult.seeded} restored, ${seedResult.existing} existing.`);
+
+      // 2. Hydrate in-memory cache with all users from Firebase
+      const allDbUsers = await getAllUsers();
+      if (allDbUsers) {
+        for (const [uid, record] of Object.entries(allDbUsers)) {
+          users.set(String(uid), record);
+          if (record.isVerified || record.verified) {
+            verifiedUsers.add(String(uid));
+          }
+        }
+        console.log(`[Firebase RTDB Boot] Local cache synced with ${users.size} total Firebase users.`);
+      }
+
+      // 3. Attach real-time listener to keep memory state synchronized live
+      subscribeToUsers((updatedUsersMap) => {
+        if (!updatedUsersMap) return;
+        for (const [uid, record] of updatedUsersMap.entries()) {
+          users.set(uid, record);
+          if (record.isVerified || record.verified) {
+            verifiedUsers.add(uid);
+          }
+        }
+      });
+
+      // 4. Seed and sync active promo codes with Firebase RTDB (/promo_codes)
+      const promoSeedRes = await seedPromoCodesIfEmpty(DEFAULT_PROMO_CODES);
+      console.log(`[Firebase RTDB Boot] Promo codes status: ${promoSeedRes.seeded} seeded, ${promoSeedRes.existing} existing.`);
+
+      const allDbCodes = await getAllPromoCodes();
+      if (allDbCodes) {
+        for (const [codeKey, cData] of Object.entries(allDbCodes)) {
+          if (!cData) continue;
+          const cleanKey = codeKey.toUpperCase();
+          const usedSet = new Set(Object.keys(cData.usedBy || {}));
+          redeemCodes.set(cleanKey, {
+            code: cleanKey,
+            points: Number(cData.points) || 5,
+            maxUses: Number(cData.maxUses) || 1000,
+            active: cData.active !== false,
+            usedBy: usedSet,
+            description: cData.description || "",
+            createdAt: cData.createdAt || new Date().toISOString()
+          });
+        }
+        console.log(`[Firebase RTDB Boot] Synced ${redeemCodes.size} promo codes from database.`);
+      }
+
+      // 5. Attach real-time listener for promo codes
+      subscribeToPromoCodes((codesData) => {
+        if (!codesData) return;
+        for (const [codeKey, cData] of Object.entries(codesData)) {
+          if (!cData) continue;
+          const cleanKey = codeKey.toUpperCase();
+          const usedSet = new Set(Object.keys(cData.usedBy || {}));
+          const existing = redeemCodes.get(cleanKey);
+          redeemCodes.set(cleanKey, {
+            code: cleanKey,
+            points: Number(cData.points) || existing?.points || 5,
+            maxUses: Number(cData.maxUses) || existing?.maxUses || 1000,
+            active: cData.active !== false,
+            usedBy: usedSet,
+            description: cData.description || existing?.description || "",
+            createdAt: cData.createdAt || existing?.createdAt || new Date().toISOString()
+          });
+        }
+      });
+
+      // 6. Hydrate and sync payout requests from Firebase RTDB (/payout_requests)
+      const allDbPayouts = await getAllPayoutRequests();
+      if (allDbPayouts) {
+        for (const [reqId, pData] of Object.entries(allDbPayouts)) {
+          if (pData) {
+            payoutRequests.set(String(reqId), pData);
+          }
+        }
+        console.log(`[Firebase RTDB Boot] Synced ${payoutRequests.size} payout requests from database.`);
+      }
+
+      // 7. Attach real-time listener for payout requests
+      subscribeToPayoutRequests((pDataObj) => {
+        if (!pDataObj) return;
+        for (const [reqId, pData] of Object.entries(pDataObj)) {
+          if (pData) {
+            payoutRequests.set(String(reqId), pData);
+          }
+        }
+      });
+    }
+  } catch (err) {
+    console.error("[Firebase RTDB Boot Error]:", err.message);
+  }
+})();
 
 // Default mandatory channels configuration
 const dynamicChannels = [
@@ -82,34 +221,77 @@ const dynamicChannels = [
   }
 ];
 
+// Pre-loaded 5 Active Unique Promo Codes (Points: 2 to 10 points)
 const redeemCodes = new Map([
+  [
+    "EIPLBONUS",
+    {
+      code: "EIPLBONUS",
+      points: 9,
+      maxUses: 1000,
+      active: true,
+      usedBy: new Set(),
+      description: "eIPL Special VIP Bonus Drop",
+      createdAt: new Date().toISOString()
+    }
+  ],
+  [
+    "LUCKY7",
+    {
+      code: "LUCKY7",
+      points: 7,
+      maxUses: 500,
+      active: true,
+      usedBy: new Set(),
+      description: "Lucky 7 Exclusive Gift Code",
+      createdAt: new Date().toISOString()
+    }
+  ],
+  [
+    "WELCOME5",
+    {
+      code: "WELCOME5",
+      points: 5,
+      maxUses: 2000,
+      active: true,
+      usedBy: new Set(),
+      description: "Welcome Free Starter Points",
+      createdAt: new Date().toISOString()
+    }
+  ],
+  [
+    "SPINWIN3",
+    {
+      code: "SPINWIN3",
+      points: 3,
+      maxUses: 1000,
+      active: true,
+      usedBy: new Set(),
+      description: "Spin & Win Extra Points Drop",
+      createdAt: new Date().toISOString()
+    }
+  ],
+  [
+    "SUPER10",
+    {
+      code: "SUPER10",
+      points: 10,
+      maxUses: 500,
+      active: true,
+      usedBy: new Set(),
+      description: "Super 10 Mega VIP Drop",
+      createdAt: new Date().toISOString()
+    }
+  ],
   [
     "EIPLFREE120",
     {
       code: "EIPLFREE120",
       points: 10,
       maxUses: 10000,
+      active: true,
       usedBy: new Set(),
-      createdAt: new Date().toISOString()
-    }
-  ],
-  [
-    "EIPL2026",
-    {
-      code: "EIPL2026",
-      points: 5,
-      maxUses: 500,
-      usedBy: new Set(),
-      createdAt: new Date().toISOString()
-    }
-  ],
-  [
-    "WELCOME10",
-    {
-      code: "WELCOME10",
-      points: 10,
-      maxUses: 100,
-      usedBy: new Set(),
+      description: "Demo Free Gift Code",
       createdAt: new Date().toISOString()
     }
   ]
@@ -147,36 +329,107 @@ function isAdmin(userId) {
 
 function getOrCreateUser(from, referrerId = null) {
   const userId = String(from.id);
-  if (!users.has(userId)) {
-    const newUser = {
+  let user = users.get(userId);
+
+  if (!user) {
+    const newUser = normalizeUserRecord(userId, {
       id: userId,
       firstName: from.first_name || "User",
       lastName: from.last_name || "",
-      username: from.username || "",
+      username: from.username ? (from.username.startsWith("@") ? from.username : `@${from.username}`) : "",
       points: 0,
-      referrerId: referrerId && referrerId !== userId ? String(referrerId) : null,
+      referrerId: referrerId && String(referrerId) !== userId ? String(referrerId) : null,
+      referrals: 0,
+      referralsCount: 0,
       isVerified: false,
+      verified: false,
       joinedAt: new Date().toISOString(),
+      joinedDate: new Date().toISOString(),
       joinedTimestamp: Date.now(),
       lastCheckin: 0,
-      lastSpin: 0,
-      referralsCount: 0
-    };
+      lastSpin: 0
+    });
     users.set(userId, newUser);
     logActivity("user_registered", `User ${newUser.firstName} (ID: ${userId}) registered.`);
+    saveUser(userId, newUser).catch(() => {});
     return newUser;
   }
-  const user = users.get(userId);
-  if (from.first_name) user.firstName = from.first_name;
-  if (from.last_name) user.lastName = from.last_name;
-  if (from.username) user.username = from.username;
+
+  let modified = false;
+  if (from.first_name && user.firstName !== from.first_name) {
+    user.firstName = from.first_name;
+    modified = true;
+  }
+  if (from.last_name && user.lastName !== from.last_name) {
+    user.lastName = from.last_name;
+    modified = true;
+  }
+  const uname = from.username ? (from.username.startsWith("@") ? from.username : `@${from.username}`) : "";
+  if (uname && user.username !== uname) {
+    user.username = uname;
+    modified = true;
+  }
   if (!user.joinedTimestamp) {
     user.joinedTimestamp = user.joinedAt ? new Date(user.joinedAt).getTime() : Date.now();
   }
-  if (user.isVerified) {
+  if (user.isVerified || user.verified) {
+    user.isVerified = true;
+    user.verified = true;
     verifiedUsers.add(userId);
   }
+  if (modified) {
+    updateUser(userId, {
+      firstName: user.firstName,
+      lastName: user.lastName,
+      username: user.username
+    }).catch(() => {});
+  }
   return user;
+}
+
+/**
+ * Calculates realtime Cash Referral & Payout stats for a user
+ */
+function getUserCashStats(userId) {
+  const strId = String(userId);
+  const user = users.get(strId);
+  const totalRefers = user ? Number(user.referralsCount || user.referrals || 0) : 0;
+
+  let pendingCash = 0;
+  let paidCash = 0;
+  let usedPendingRefers = 0;
+  let usedPaidRefers = 0;
+  let pendingRequest = null;
+
+  for (const req of payoutRequests.values()) {
+    if (String(req.userId) === strId) {
+      if (req.status === "PENDING") {
+        pendingCash += Number(req.amount || 0);
+        usedPendingRefers += Number(req.refersCount || 0);
+        if (!pendingRequest) pendingRequest = req;
+      } else if (req.status === "PAID" || req.status === "Completed") {
+        paidCash += Number(req.amount || 0);
+        usedPaidRefers += Number(req.refersCount || 0);
+      }
+    }
+  }
+
+  // Available refers is total verified refers minus pending & paid refers
+  const availableRefers = Math.max(0, totalRefers - usedPendingRefers - usedPaidRefers);
+  // Rule: Minimum payout ₹10 (10 refers). If 50+ refers, calculate ₹100 flat bonus.
+  const availableCash = availableRefers >= 50 ? 100 : availableRefers;
+
+  return {
+    totalRefers,
+    availableRefers,
+    availableCash,
+    pendingCash,
+    paidCash,
+    usedPendingRefers,
+    usedPaidRefers,
+    hasPending: Boolean(pendingRequest),
+    pendingRequest
+  };
 }
 
 // ==========================================
@@ -192,30 +445,53 @@ function getOrCreateUser(from, referrerId = null) {
 function getMainReplyKeyboard(userId) {
   const kb = new Keyboard();
 
-  // ROW 1 (Blue / Primary): "🎰 Spin & Win" | "⏰ Roz ka Check-in"
+  // ROW 1 (Green / Success - Prominent!): "👥 Refer & Earn (₹ Cash)"
+  kb.text("👥 Refer & Earn (₹ Cash)").success().row();
+
+  // ROW 2 (Blue / Primary): "🎰 Spin & Win" | "⏰ Roz ka Check-in"
   kb.text("🎰 Spin & Win").primary().text("⏰ Roz ka Check-in").primary().row();
 
-  // ROW 2 (Green / Success): "💰 Earn Money (Invite)" | "🔥 Hot Offers"
+  // ROW 3 (Green / Success): "💰 Earn Money (Invite)" | "🔥 Hot Offers"
   kb.text("💰 Earn Money (Invite)").success().text("🔥 Hot Offers").success().row();
 
-  // ROW 3 (Blue / Primary): "💎 Point Balance" | "🏆 Leaderboard"
+  // ROW 4 (Blue / Primary): "💎 Point Balance" | "🏆 Leaderboard"
   kb.text("💎 Point Balance").primary().text("🏆 Leaderboard").primary().row();
 
-  // ROW 4 (Green / Success): "🎯 Redeem Points" | "🎁 Secret Gift Code"
+  // ROW 5 (Green / Success): "🎯 Redeem Points" | "🎁 Secret Gift Code"
   kb.text("🎯 Redeem Points").success().text("🎁 Secret Gift Code").success().row();
 
-  // ROW 5 (Blue / Primary): "📞 Customer Support"
+  // ROW 6 (Blue / Primary): "📞 Customer Support"
   kb.text("📞 Customer Support").primary().row();
 
-  // ROW 6 (Red / Danger): "⚙️ Admin Panel" (Admin Only)
+  // ROW 7 (Red / Danger): "⚙️ Admin Panel" (Admin Only)
   if (userId && isAdmin(userId)) {
     kb.text("⚙️ Admin Panel").danger().row();
   }
 
-  // ROW 7 (Red / Danger): "❌ Close Menu"
+  // ROW 8 (Red / Danger): "❌ Close Menu"
   kb.text("❌ Close Menu").danger();
 
   return kb.resized();
+}
+
+/**
+ * Dedicated Sub-Menu Keyboard for Cash Refer & Payout
+ */
+function getCashReferInlineKeyboard() {
+  return new InlineKeyboard()
+    .text("🔗 My Referral Link", "cash_ref_link")
+    .text("📊 My Refers List", "cash_ref_list").row()
+    .text("💸 Request Payout", "cash_ref_request")
+    .text("📜 Payout History", "cash_ref_history").row()
+    .text("🔙 Back to Main Menu", "cash_ref_back");
+}
+
+function getCashReferReplyKeyboard() {
+  return new Keyboard()
+    .text("🔗 My Referral Link").primary().text("📊 My Refers List").primary().row()
+    .text("💸 Request Payout").success().text("📜 Payout History").success().row()
+    .text("🔙 Back to Main Menu").danger()
+    .resized();
 }
 
 /**
@@ -223,11 +499,11 @@ function getMainReplyKeyboard(userId) {
  */
 function getAdminReplyKeyboard() {
   return new Keyboard()
+    .text("💳 Manage Payouts").success().text("👥 View Users List").primary().row()
     .text("➕ Add Force Channel").primary().text("📋 View/Remove Channels").primary().row()
     .text("🎟 Create Redeem Code").success().text("👤 Add Admin").success().row()
-    .text("👥 View Users List").primary().text("📊 Bot Stats").primary().row()
     .text("💳 Manage Points").success().text("🔘 Toggle Withdrawals").danger().row()
-    .text("📢 Broadcast Msg").primary().row()
+    .text("📊 Bot Stats").primary().text("📢 Broadcast Msg").primary().row()
     .text("🔙 Back to User Menu").danger()
     .resized();
 }
@@ -274,7 +550,8 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
   try {
     bot = new Bot(BOT_TOKEN);
 
-    // Transformer: Sanitize all outgoing text and caption payloads to ensure valid UTF-8
+    // Transformer: Sanitize all outgoing text and caption payloads to ensure valid UTF-8,
+    // and gracefully handle 403 Forbidden errors when a user has blocked the bot
     bot.api.config.use(async (prev, method, payload, signal) => {
       if (payload && typeof payload === "object") {
         for (const key of ["text", "caption"]) {
@@ -283,13 +560,32 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
           }
         }
       }
-      return prev(method, payload, signal);
+      try {
+        return await prev(method, payload, signal);
+      } catch (err) {
+        const isBlocked =
+          err?.error_code === 403 ||
+          String(err?.message || err?.description || "").toLowerCase().includes("blocked by the user");
+        if (isBlocked) {
+          console.warn(`[Telegram API] Call to '${method}' skipped (403: Bot blocked by user). Chat ID: ${payload?.chat_id}`);
+          return { ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" };
+        }
+        throw err;
+      }
     });
 
     // Global Error Handler so the bot never crashes the process
     bot.catch((err) => {
+      const errObj = err.error || err;
+      const isBlocked =
+        errObj?.error_code === 403 ||
+        String(errObj?.message || errObj?.description || "").toLowerCase().includes("blocked by the user");
+      if (isBlocked) {
+        console.warn(`[Telegram Bot] Update ${err.ctx?.update?.update_id}: User blocked the bot (403 Forbidden). Handled gracefully.`);
+        return;
+      }
       console.error(`[Telegram Bot Error] Error in update ${err.ctx?.update?.update_id}:`, err.error);
-      botStatus.error = err.error?.message || "Telegram API error";
+      botStatus.error = errObj?.message || "Telegram API error";
     });
 
     // Middleware: Force Channel Join Check with persistent Cache
@@ -424,26 +720,43 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
         });
       }
 
-      const wasVerified = user.isVerified;
+      const wasVerified = user.isVerified || user.verified;
       user.isVerified = true;
+      user.verified = true;
       verifiedUsers.add(userId);
+      updateUser(userId, { isVerified: true, verified: true }).catch(() => {});
 
       // Award +2 points to referrer on first verification
       if (!wasVerified && user.referrerId && users.has(user.referrerId)) {
         const referrer = users.get(user.referrerId);
-        referrer.points += 2;
-        referrer.referralsCount += 1;
+        referrer.points = (referrer.points || 0) + 2;
+        referrer.referralsCount = (referrer.referralsCount || 0) + 1;
+        referrer.referrals = referrer.referralsCount;
         logActivity("referral_bonus", `+2 Points to ${referrer.firstName} for referring ${user.firstName}`);
+
+        updateUserPoints(user.referrerId, 2).catch(() => {});
+        updateUser(user.referrerId, {
+          referrals: referrer.referralsCount,
+          referralsCount: referrer.referralsCount
+        }).catch(() => {});
+
+        const refCashStats = getUserCashStats(user.referrerId);
+        updateUserReferralCash(user.referrerId, {
+          totalRefers: referrer.referralsCount,
+          availableBalance: refCashStats.availableCash,
+          totalWithdrawn: refCashStats.paidCash
+        }).catch(() => {});
 
         try {
           await ctx.api.sendMessage(
             user.referrerId,
             `🎉 ━━━━━━━━━━━━━━━━━━\n` +
-            `🎁 <b>Naya Referral Bonus!</b>\n` +
+            `🎁 <b>Naya Cash & Points Referral Bonus!</b>\n` +
             `━━━━━━━━━━━━━━━━━━\n` +
             `Aapke invite link se <b>${escapeHtml(user.firstName)}</b> ne bot join &amp; verify kar liya hai!\n\n` +
-            `💎 <b>Reward:</b> <code>+2 Points</code>\n` +
-            `💰 <b>Kul Balance:</b> <b>${referrer.points} Points</b>\n` +
+            `💎 <b>Reward:</b> <code>+2 Points</code> &amp; <b>+1 Cash Refer (₹1+)</b>\n` +
+            `💰 <b>Kul Point Balance:</b> <b>${referrer.points} Points</b>\n` +
+            `💵 <b>Available Cash For Payout:</b> <b>₹${refCashStats.availableCash}</b> (${refCashStats.availableRefers} Refers)\n` +
             `👥 <b>Total Referrals:</b> <b>${referrer.referralsCount}</b>\n` +
             `━━━━━━━━━━━━━━━━━━`,
             { parse_mode: "HTML" }
@@ -510,9 +823,12 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
 
       // Random points between 1 and 10
       const wonPoints = Math.floor(Math.random() * 10) + 1;
-      user.points += wonPoints;
+      user.points = (user.points || 0) + wonPoints;
       user.lastSpin = now;
       logActivity("spin_win", `User ${user.firstName} (ID: ${user.id}) won ${wonPoints} points on Spin & Win.`);
+
+      updateUserPoints(user.id, wonPoints).catch(() => {});
+      updateUser(user.id, { lastSpin: now }).catch(() => {});
 
       // Brief animation suspense
       await new Promise((r) => setTimeout(r, 1100));
@@ -577,9 +893,12 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
         );
       }
 
-      user.points += 1;
+      user.points = (user.points || 0) + 1;
       user.lastCheckin = now;
       logActivity("checkin", `User ${user.firstName} received +1 daily point.`);
+
+      updateUserPoints(user.id, 1).catch(() => {});
+      updateUser(user.id, { lastCheckin: now }).catch(() => {});
 
       const kb = new InlineKeyboard()
         .text("🎰 Spin & Win", "open_spin")
@@ -732,6 +1051,341 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
     bot.hears([/Earn Money/i, /Invite/i, /kamaayein/i, /^\/invite$/i, /^\/refer$/i], sendInviteDetails);
     bot.callbackQuery("open_invite", sendInviteDetails);
 
+    // ==========================================
+    // CASH REFER & PAYOUT DASHBOARD (USER)
+    // ==========================================
+    async function sendCashReferDashboard(ctx) {
+      const user = getOrCreateUser(ctx.from);
+      const stats = getUserCashStats(user.id);
+
+      const text =
+        `👥 ━━━━━━━━━━━━━━━━━━\n` +
+        `💰 <b>CASH REFER & PAYOUT DASHBOARD</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Namaste <b>${escapeHtml(user.firstName)}</b>! Apne doston ko invite karke seedhe <b>Real Cash (₹)</b> kamaayein aur apne UPI / Bank account mein payout paayein!\n\n` +
+        `📊 <b>Aapka Cash Overview:</b>\n` +
+        `• 👥 <b>Total Verified Refers:</b> <code>${stats.totalRefers} Users</code>\n` +
+        `• 💵 <b>Available For Payout:</b> <b>${stats.availableRefers} Refers (₹${stats.availableCash})</b>\n` +
+        `• ⏳ <b>Pending Payout:</b> <code>₹${stats.pendingCash}</code>\n` +
+        `• 💰 <b>Total Paid / Withdrawn:</b> <code>₹${stats.paidCash}</code>\n\n` +
+        `📌 <b>Payout Rules & Bonuses:</b>\n` +
+        `• <b>Minimum Payout:</b> ₹10 (10 refers required)\n` +
+        `• <b>1 Refer:</b> ₹1 Cash\n` +
+        `• <b>50+ Refers Mega Bonus:</b> Flat <b>₹100 Cash Bonus!</b> 🎁\n` +
+        `• <b>Payment Methods:</b> UPI ID, PhonePe, Paytm, Google Pay\n\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `👇 <i>Neeche diye gaye buttons se option chunein:</i>`;
+
+      if (ctx.callbackQuery) {
+        try { await ctx.answerCallbackQuery(); } catch (_) {}
+      }
+      await ctx.reply(text, {
+        parse_mode: "HTML",
+        reply_markup: getCashReferInlineKeyboard()
+      });
+    }
+
+    bot.hears([/Refer & Earn/i, /Cash Refer/i, /^\/cashrefer$/i, /^\/payout$/i], sendCashReferDashboard);
+    bot.callbackQuery("open_cash_refer_menu", sendCashReferDashboard);
+
+    // 1. 🔗 [My Referral Link]
+    async function sendMyReferralLink(ctx) {
+      const user = getOrCreateUser(ctx.from);
+      const stats = getUserCashStats(user.id);
+      const botName = botStatus.username || "eipl_bot";
+      const link = `https://t.me/${botName}?start=${user.id}`;
+      const shareMsg = `🏏 Join eIPL Official Bot now & get Real Cash Rewards! Invite your friends and earn instant UPI Cash:\n${link}`;
+
+      const kb = new InlineKeyboard()
+        .url("🚀 Share on Telegram", `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareMsg)}`).row()
+        .text("💸 Request Payout", "cash_ref_request")
+        .text("📊 My Refers List", "cash_ref_list").row()
+        .text("🔙 Refer Menu", "open_cash_refer_menu");
+
+      const text =
+        `🔗 ━━━━━━━━━━━━━━━━━━\n` +
+        `👥 <b>MY REFERRAL LINK & STATS</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Apna exclusive invite link doston aur WhatsApp/Telegram groups mein share karein. Har verified join par cash reward paayein!\n\n` +
+        `🔗 <b>Aapka Unique Referral Link:</b>\n` +
+        `<code>${link}</code>\n\n` +
+        `📊 <b>Real-time Stats:</b>\n` +
+        `• 👥 <b>Total Refers:</b> <code>${stats.totalRefers} Users</code>\n` +
+        `• ⏳ <b>Pending ₹:</b> <code>₹${stats.pendingCash}</code>\n` +
+        `• 💰 <b>Earned & Paid ₹:</b> <code>₹${stats.paidCash}</code>\n` +
+        `• 💵 <b>Available For Payout:</b> <code>${stats.availableRefers} Refers (₹${stats.availableCash})</code>\n\n` +
+        `🎁 <b>Milestone Offer:</b> 50+ Refers complete karne par paayein flat <b>₹100 bonus</b>!\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `👇 <i>Doston ke sath link share karne ke liye neeche button dabayein:</i>`;
+
+      if (ctx.callbackQuery) {
+        try { await ctx.answerCallbackQuery(); } catch (_) {}
+      }
+      await ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+    }
+
+    bot.hears([/My Referral Link/i, /Referral Link/i, /^\/reflink$/i], sendMyReferralLink);
+    bot.callbackQuery("cash_ref_link", sendMyReferralLink);
+
+    // 2. 📊 [My Refers List]
+    async function sendMyRefersList(ctx) {
+      const user = getOrCreateUser(ctx.from);
+      const userId = String(user.id);
+      const botName = botStatus.username || "eipl_bot";
+      const link = `https://t.me/${botName}?start=${user.id}`;
+
+      // Filter all users referred by this user
+      const referredUsers = [];
+      for (const u of users.values()) {
+        if (String(u.referrerId) === userId) {
+          referredUsers.push(u);
+        }
+      }
+
+      // Sort newest first
+      referredUsers.sort((a, b) => (b.joinedTimestamp || 0) - (a.joinedTimestamp || 0));
+
+      const kb = new InlineKeyboard()
+        .text("🔗 Invite Friends", "cash_ref_link")
+        .text("💸 Request Payout", "cash_ref_request").row()
+        .text("🔙 Refer Menu", "open_cash_refer_menu");
+
+      if (referredUsers.length === 0) {
+        const text =
+          `📊 ━━━━━━━━━━━━━━━━━━\n` +
+          `👥 <b>MY REFERS LIST</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Abhi tak aapne kisi bhi user ko invite nahi kiya hai.\n\n` +
+          `🔗 <b>Apna Link Share Karein:</b>\n` +
+          `<code>${link}</code>\n\n` +
+          `💡 <i>Doston ko invite karein aur har verified join par cash reward paayein!</i>`;
+
+        if (ctx.callbackQuery) {
+          try { await ctx.answerCallbackQuery(); } catch (_) {}
+        }
+        return ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+      }
+
+      const recent = referredUsers.slice(0, 10);
+      let listItems = "";
+      recent.forEach((u, i) => {
+        const name = escapeHtml(`${u.firstName || ""} ${u.lastName || ""}`.trim() || u.username || "User");
+        const uTag = u.username ? ` (${escapeHtml(u.username)})` : "";
+        const dateStr = new Date(u.joinedTimestamp || u.joinedAt).toLocaleDateString("en-IN", {
+          day: "numeric",
+          month: "short",
+          year: "numeric"
+        });
+        const statusStr = (u.isVerified || u.verified) ? "✅ Verified" : "⚠️ Unverified";
+        listItems += `<b>${i + 1}. ${name}</b>${uTag}\n   📅 Joined: <code>${dateStr}</code> | Status: ${statusStr}\n\n`;
+      });
+
+      const text =
+        `📊 ━━━━━━━━━━━━━━━━━━\n` +
+        `👥 <b>MY REFERRED USERS (Last ${recent.length} of ${referredUsers.length})</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Aapke invite link se join karne wale sadasya:\n\n` +
+        listItems +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `💡 <i>Sirf verified members par hi ₹ cash payout reward count hota hai.</i>`;
+
+      if (ctx.callbackQuery) {
+        try { await ctx.answerCallbackQuery(); } catch (_) {}
+      }
+      await ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+    }
+
+    bot.hears([/My Refers List/i, /Refers List/i, /^\/myrefers$/i], sendMyRefersList);
+    bot.callbackQuery("cash_ref_list", sendMyRefersList);
+
+    // 3. 💸 [Request Payout]
+    async function startPayoutRequest(ctx) {
+      const user = getOrCreateUser(ctx.from);
+      const stats = getUserCashStats(user.id);
+
+      // Check rule: prevent multiple duplicate requests while one is still PENDING
+      if (stats.hasPending && stats.pendingRequest) {
+        const pr = stats.pendingRequest;
+        const dateStr = new Date(pr.timestamp).toLocaleString("en-IN");
+        const kb = new InlineKeyboard()
+          .text("📜 Payout History", "cash_ref_history").row()
+          .text("🔙 Refer Menu", "open_cash_refer_menu");
+
+        const text =
+          `⚠️ ━━━━━━━━━━━━━━━━━━\n` +
+          `⏳ <b>PENDING PAYOUT REQUEST ACTIVE!</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Aapki ek payout request pehle se <b>PENDING</b> hai:\n\n` +
+          `📌 <b>Request ID:</b> <code>${pr.requestId}</code>\n` +
+          `💵 <b>Amount:</b> <b>₹${pr.amount}</b> (${pr.refersCount} Refers)\n` +
+          `📱 <b>Payment Method:</b> <code>${escapeHtml(pr.paymentDetails)}</code>\n` +
+          `📅 <b>Submitted On:</b> <code>${dateStr}</code>\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `⚠️ <i>Aap ek samay par sirf ek pending request rakh sakte hain. Yeh request complete hone ke baad hi aap doosri request bhej sakenge.</i>`;
+
+        if (ctx.callbackQuery) {
+          try { await ctx.answerCallbackQuery(); } catch (_) {}
+        }
+        return ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+      }
+
+      // Check rule: Minimum payout ₹10 (10 refers)
+      if (stats.availableRefers < 10) {
+        const needed = 10 - stats.availableRefers;
+        const kb = new InlineKeyboard()
+          .text("🔗 Get Referral Link", "cash_ref_link").row()
+          .text("🔙 Refer Menu", "open_cash_refer_menu");
+
+        const text =
+          `⚠️ ━━━━━━━━━━━━━━━━━━\n` +
+          `❌ <b>MINIMUM PAYOUT REQUIREMENT</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Cash payout request bhejne ke liye kam se kam <b>10 verified refers (₹10)</b> hone chahiye.\n\n` +
+          `👥 <b>Aapke Available Refers:</b> <b>${stats.availableRefers} Refers</b>\n` +
+          `⏳ <b>Zaroori Refers:</b> <b>${needed} aur refers chahiye</b>\n\n` +
+          `💡 <b>Bonuses & Multipliers:</b>\n` +
+          `• 10 Refers ➔ ₹10 Payout\n` +
+          `• 25 Refers ➔ ₹25 Payout\n` +
+          `• 50+ Refers ➔ <b>Flat ₹100 Mega Bonus!</b> 🎁\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `👇 <i>Apna invite link share karke aur doston ko jodein:</i>`;
+
+        if (ctx.callbackQuery) {
+          try { await ctx.answerCallbackQuery(); } catch (_) {}
+        }
+        return ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+      }
+
+      // Calculate payout amount (flat ₹100 bonus for 50+ refers, else ₹1 per refer)
+      const payoutAmount = stats.availableRefers >= 50 ? 100 : stats.availableRefers;
+
+      userStates.set(String(user.id), {
+        action: "awaiting_payout_payment_details",
+        data: {
+          availableRefers: stats.availableRefers,
+          amount: payoutAmount
+        }
+      });
+
+      const kb = new InlineKeyboard().text("❌ Cancel", "cancel_action");
+
+      const bonusNote = stats.availableRefers >= 50
+        ? `\n🎁 <b>50+ Refers Mega Offer: Flat ₹100 Bonus Activated!</b>\n`
+        : "";
+
+      const text =
+        `💸 ━━━━━━━━━━━━━━━━━━\n` +
+        `💳 <b>REQUEST CASH PAYOUT</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Aap <b>${stats.availableRefers} Refers</b> ke badle <b>₹${payoutAmount} Cash</b> withdraw kar rahe hain!${bonusNote}\n` +
+        `Kripya apna Payment Method bhejein:\n` +
+        `• <b>UPI ID:</b> <code>yourname@upi</code> ya <code>number@okaxis</code>\n` +
+        `• <b>PhonePe / Paytm / Google Pay Number:</b> <code>9876543210</code>\n` +
+        `• <b>Scanner / QR Code Link</b>\n\n` +
+        `👇 <i>Neeche chat mein apna payment details likh kar bhejein:</i>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `❌ <i>Cancel karne ke liye /cancel type karein.</i>`;
+
+      if (ctx.callbackQuery) {
+        try { await ctx.answerCallbackQuery(); } catch (_) {}
+      }
+      await ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+    }
+
+    bot.hears([/Request Payout/i, /Payout Request/i, /^\/requestpayout$/i], startPayoutRequest);
+    bot.callbackQuery("cash_ref_request", startPayoutRequest);
+
+    // 4. 📜 [Payout History]
+    async function sendPayoutHistory(ctx) {
+      const user = getOrCreateUser(ctx.from);
+      const userId = String(user.id);
+
+      const userRequests = [];
+      for (const req of payoutRequests.values()) {
+        if (String(req.userId) === userId) {
+          userRequests.push(req);
+        }
+      }
+
+      userRequests.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+      const kb = new InlineKeyboard()
+        .text("💸 Request Payout", "cash_ref_request").row()
+        .text("🔙 Refer Menu", "open_cash_refer_menu");
+
+      if (userRequests.length === 0) {
+        const text =
+          `📜 ━━━━━━━━━━━━━━━━━━\n` +
+          `💳 <b>PAYOUT HISTORY</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Aapne abhi tak koi payout request nahi bheji hai.\n\n` +
+          `10 verified refers hone par aap direct cash payout request bhej sakte hain!`;
+
+        if (ctx.callbackQuery) {
+          try { await ctx.answerCallbackQuery(); } catch (_) {}
+        }
+        return ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+      }
+
+      let historyText = "";
+      userRequests.slice(0, 10).forEach((req, i) => {
+        let statusBadge = "🟡 PENDING";
+        if (req.status === "PAID" || req.status === "Completed") statusBadge = "✅ COMPLETED & PAID";
+        else if (req.status === "REJECTED") statusBadge = `❌ REJECTED ${req.rejectionReason ? `(${escapeHtml(req.rejectionReason)})` : ""}`;
+
+        const dateStr = new Date(req.timestamp).toLocaleDateString("en-IN", {
+          day: "numeric",
+          month: "short",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit"
+        });
+
+        historyText +=
+          `<b>${i + 1}. Request ID:</b> <code>${req.requestId}</code>\n` +
+          `   💵 <b>Amount:</b> ₹${req.amount} (${req.refersCount || 10} Refers)\n` +
+          `   📱 <b>Payment Method:</b> <code>${escapeHtml(req.paymentDetails || "N/A")}</code>\n` +
+          `   🛡 <b>Status:</b> ${statusBadge}\n` +
+          `   📅 <b>Date:</b> <code>${dateStr}</code>\n\n`;
+      });
+
+      const text =
+        `📜 ━━━━━━━━━━━━━━━━━━\n` +
+        `💳 <b>PAYOUT REQUESTS HISTORY (${userRequests.length})</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        historyText +
+        `━━━━━━━━━━━━━━━━━━`;
+
+      if (ctx.callbackQuery) {
+        try { await ctx.answerCallbackQuery(); } catch (_) {}
+      }
+      await ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+    }
+
+    bot.hears([/Payout History/i, /^\/payouthistory$/i], sendPayoutHistory);
+    bot.callbackQuery("cash_ref_history", sendPayoutHistory);
+
+    // 5. 🔙 [Back to Main Menu]
+    bot.hears([/🔙 Back to Main Menu/i, /Back to Main Menu/i], async (ctx) => {
+      await ctx.reply(
+        `🏏 ━━━━━━━━━━━━━━━━━━\n` +
+        `🏆 <b>MAIN USER DASHBOARD</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Main menu activate ho gaya hai:`,
+        { parse_mode: "HTML", reply_markup: getMainReplyKeyboard(ctx.from.id) }
+      );
+    });
+    bot.callbackQuery("cash_ref_back", async (ctx) => {
+      try { await ctx.answerCallbackQuery(); } catch (_) {}
+      await ctx.reply(
+        `🏏 ━━━━━━━━━━━━━━━━━━\n` +
+        `🏆 <b>MAIN USER DASHBOARD</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Main menu activate ho gaya hai:`,
+        { parse_mode: "HTML", reply_markup: getMainReplyKeyboard(ctx.from.id) }
+      );
+    });
+
     // User: 💎 Point Balance
     async function sendUserBalance(ctx, isEdit = false) {
       const user = getOrCreateUser(ctx.from);
@@ -855,37 +1509,150 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
     bot.hears([/Redeem Points/i, /Redeem Point/i, /^\/redeem$/i], sendRedeemDetails);
     bot.callbackQuery("open_redeem", sendRedeemDetails);
 
-    // User: 🎁 Secret Gift Code
-    bot.hears([/Secret Gift/i, /Gift Code/i], async (ctx) => {
+    // ==========================================
+    // GIFT CODE / PROMO CODE REDEMPTION LOGIC
+    // ==========================================
+    async function processRedeemCode(ctx, rawCode, user) {
+      const userId = String(user.id);
+      const codeInput = String(rawCode || "").trim().toUpperCase().replace(/[^A-Z0-9_]/g, "");
+
+      if (!codeInput) {
+        return ctx.reply("❌ Kripya valid Gift ya Promo Code bhejein.", {
+          parse_mode: "HTML",
+          reply_markup: getMainReplyKeyboard(ctx.from?.id)
+        });
+      }
+
+      const codeObj = redeemCodes.get(codeInput);
+      if (!codeObj || codeObj.active === false) {
+        return ctx.reply(
+          `❌ <b>Galat ya Expired Code!</b>\n` +
+          `Code <code>${escapeHtml(codeInput)}</code> exist nahi karta ya expire ho chuka hai.\n\n` +
+          `👉 Kripya valid code check karke dobara type karein ya official channels join karein.`,
+          {
+            parse_mode: "HTML",
+            reply_markup: getMainReplyKeyboard(ctx.from?.id)
+          }
+        );
+      }
+
+      // Check if user has already redeemed this specific code
+      const alreadyClaimed =
+        codeObj.usedBy.has(userId) ||
+        Boolean(user.redeemedCodes && user.redeemedCodes[codeInput]);
+
+      if (alreadyClaimed) {
+        return ctx.reply(
+          `⚠️ <b>Already Redeemed!</b>\n` +
+          `Aap pehle hi code <code>${escapeHtml(codeInput)}</code> redeem kar chuke hain.\n` +
+          `📌 <i>Ek Telegram user ek gift code ko sirf ek hi baar claim kar sakta hai.</i>`,
+          {
+            parse_mode: "HTML",
+            reply_markup: getMainReplyKeyboard(ctx.from?.id)
+          }
+        );
+      }
+
+      // Check if maximum global limit reached
+      if (codeObj.maxUses && codeObj.usedBy.size >= codeObj.maxUses) {
+        return ctx.reply(
+          `⚠️ <b>Limit Full!</b>\n` +
+          `Is gift code <code>${escapeHtml(codeInput)}</code> ki maximum usage limit (<code>${codeObj.maxUses}</code> users) poori ho chuki hai.\n` +
+          `📢 Naye promo drops ke liye hamare channels par active rahein!`,
+          {
+            parse_mode: "HTML",
+            reply_markup: getMainReplyKeyboard(ctx.from?.id)
+          }
+        );
+      }
+
+      // Success! Grant Points and mark redeemed
+      codeObj.usedBy.add(userId);
+      user.points = (user.points || 0) + codeObj.points;
+      if (!user.redeemedCodes) user.redeemedCodes = {};
+      user.redeemedCodes[codeInput] = Date.now();
+
+      logActivity("code_redeemed", `User ${user.firstName} (ID: ${userId}) redeemed ${codeInput} for +${codeObj.points} pts.`);
+
+      // Persist to Firebase Realtime Database
+      updateUserPoints(user.id, codeObj.points).catch(() => {});
+      recordPromoCodeRedemption(codeInput, userId).catch(() => {});
+      updateUser(user.id, {
+        points: user.points,
+        redeemedCodes: user.redeemedCodes
+      }).catch(() => {});
+
+      const kb = new InlineKeyboard()
+        .text("🎰 Spin & Win", "open_spin")
+        .text("💎 Point Balance", "refresh_balance").row()
+        .text("🏆 Leaderboard", "open_leaderboard");
+
+      return ctx.reply(
+        `🎉 ━━━━━━━━━━━━━━━━━━\n` +
+        `🎁 <b>GIFT CODE REDEEMED SUCCESSFULLY!</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Kamaal kar diya <b>${escapeHtml(user.firstName)}</b>! Aapka Secret Gift Code safalta-poorvak redeem ho chuka hai!\n\n` +
+        `🎟 <b>Redeemed Code:</b> <code>${escapeHtml(codeInput)}</code>\n` +
+        `💎 <b>Points Credited:</b> <b>+${codeObj.points} Points</b>\n` +
+        `💰 <b>Aapka Naya Balance:</b> <b>${user.points} Points</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🚀 <i>Aur points earn karne ke liye <b>🎰 Spin & Win</b> karein ya apne doston ko invite karein!</i>`,
+        {
+          parse_mode: "HTML",
+          reply_markup: kb
+        }
+      );
+    }
+
+    async function handleGiftCodePrompt(ctx) {
+      const from = ctx.from;
+      if (!from) return;
+      const user = getOrCreateUser(from);
+
+      // Check if command has code passed directly: e.g. /gift EIPLBONUS or /redeem LUCKY7
+      const text = (ctx.message?.text || "").trim();
+      const match = text.match(/^\/(?:gift|giftcode|redeem|code|promo|promocode)\s+([A-Za-z0-9_]+)$/i);
+      if (match) {
+        return processRedeemCode(ctx, match[1], user);
+      }
+
+      userStates.set(String(from.id), { action: "awaiting_redeem_code" });
+
       const kb = new InlineKeyboard()
         .url("📢 Official Channels", formatTelegramUrl(dynamicChannels[0]?.link || SUPPORT_URL)).row()
-        .url("📞 Customer Support", SUPPORT_URL);
+        .text("❌ Cancel", "cancel_action");
 
       await ctx.reply(
         `🎁 ━━━━━━━━━━━━━━━━━━\n` +
-        `✨ <b>SECRET VIP GIFT DROPS</b>\n` +
+        `✨ <b>SECRET VIP GIFT CODE REDEMPTION</b>\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `🚀 <b>Grand Tournament Drops Coming Soon!</b>\n\n` +
-        `VIP Secret Gift Codes hamare official Telegram channels aur live tournament matches ke dauran drop kiye jayenge.\n` +
+        `Namaste <b>${escapeHtml(user.firstName)}</b>! Yahan apna <b>Secret Gift Code</b> ya <b>Promo Code</b> submit karein aur turant balance mein bonus points claim karein!\n\n` +
+        `💎 <b>VIP Active Codes:</b>\n` +
+        `• <code>EIPLBONUS</code> — +9 Points (VIP Bonus)\n` +
+        `• <code>LUCKY7</code> — +7 Points (Lucky Gift)\n` +
+        `• <code>WELCOME5</code> — +5 Points (Welcome Starter)\n` +
+        `• <code>SPINWIN3</code> — +3 Points (Spin Booster)\n` +
+        `• <code>SUPER10</code> — +10 Points (Mega Drop)\n\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `📢 <i>Channels par active rahein aur notifications ON rakhein!</i>`,
+        `👇 <i>Apna code abhi chat mein type karke bhejein:</i>\n` +
+        `❌ <i>Cancel karne ke liye /cancel type karein.</i>`,
         { parse_mode: "HTML", reply_markup: kb }
       );
-    });
+    }
 
-    // User: 🎫 Redeem Code Prompt
-    bot.hears([/Redeem Code/i, /Promo Code/i], async (ctx) => {
-      userStates.set(String(ctx.from.id), { action: "awaiting_redeem_code" });
-      await ctx.reply(
-        `🎫 ━━━━━━━━━━━━━━━━━━\n` +
-        `🎟 <b>ENTER PROMO CODE</b>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `Apna Secret Promo / Gift Code yahan chat mein type karke bhejein:\n\n` +
-        `📌 <i>Try Demo Code:</i> <code>EIPLFREE120</code>\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `❌ <i>Cancel karne ke liye /cancel type karein.</i>`,
-        { parse_mode: "HTML" }
-      );
+    // User: 🎁 Secret Gift Code & 🎫 Redeem Code Triggers
+    bot.hears([/Secret Gift/i, /Gift Code/i, /🎁/i, /Redeem Code/i, /Promo Code/i], handleGiftCodePrompt);
+    bot.command(["gift", "giftcode", "code", "promo", "promocode", "claim"], handleGiftCodePrompt);
+    bot.callbackQuery("open_secret_gift", async (ctx) => {
+      await ctx.answerCallbackQuery();
+      return handleGiftCodePrompt(ctx);
+    });
+    bot.callbackQuery("cancel_action", async (ctx) => {
+      userStates.delete(String(ctx.from.id));
+      await ctx.answerCallbackQuery({ text: "Action Cancelled" });
+      await ctx.reply("❌ Action cancel kar diya gaya hai.", {
+        reply_markup: getMainReplyKeyboard(ctx.from.id)
+      });
     });
 
     // User: 📞 Customer Support
@@ -952,6 +1719,7 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
         `━━━━━━━━━━━━━━━━━━\n` +
         `👤 <b>Admin:</b> ${escapeHtml(ctx.from.first_name)} (<code>${ctx.from.id}</code>)\n` +
         `👥 <b>Total Users:</b> <code>${users.size}</code>\n` +
+        `💳 <b>Payout Requests:</b> <code>${Array.from(payoutRequests.values()).filter(r => r.status === "PENDING").length} Pending / ${payoutRequests.size} Total</code>\n` +
         `📢 <b>Active Channels:</b> <code>${dynamicChannels.length}</code>\n` +
         `🎟 <b>Promo Codes:</b> <code>${redeemCodes.size}</code>\n` +
         `💸 <b>Withdrawals:</b> <b>${withdrawalsEnabled ? "🟢 ENABLED" : "🔴 PAUSED"}</b>\n` +
@@ -960,6 +1728,380 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
         { parse_mode: "HTML", reply_markup: getAdminReplyKeyboard() }
       );
     });
+
+    // ==========================================
+    // ADMIN: 💳 MANAGE PAYOUTS & CONTROLS
+    // ==========================================
+    async function sendAdminPayoutDashboard(ctx) {
+      if (!isAdmin(ctx.from.id)) return ctx.reply("⛔ Access Denied.");
+
+      const allReqs = Array.from(payoutRequests.values());
+      const pendingReqs = allReqs.filter((r) => r.status === "PENDING");
+      const paidReqs = allReqs.filter((r) => r.status === "PAID" || r.status === "Completed");
+      const rejectedReqs = allReqs.filter((r) => r.status === "REJECTED");
+      const totalPaidAmount = paidReqs.reduce((acc, r) => acc + Number(r.amount || 0), 0);
+
+      const kb = new InlineKeyboard()
+        .text(`📋 View Pending Payouts (${pendingReqs.length})`, "admin_view_pending_payouts").row()
+        .text("📜 All Payouts History", "admin_view_all_payouts")
+        .text("📥 Export Payouts CSV", "admin_export_payouts_csv").row()
+        .text("🔙 Back to Admin Menu", "admin_back_to_menu");
+
+      const text =
+        `💳 ━━━━━━━━━━━━━━━━━━\n` +
+        `🛡 <b>PAYOUT REQUESTS MANAGEMENT</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Cash payout requests ko review aur approve/reject karein:\n\n` +
+        `📋 <b>Pending Requests:</b> <code>${pendingReqs.length}</code>\n` +
+        `✅ <b>Completed & Paid:</b> <code>${paidReqs.length}</code>\n` +
+        `❌ <b>Rejected:</b> <code>${rejectedReqs.length}</code>\n` +
+        `💰 <b>Total Paid Out:</b> <b>₹${totalPaidAmount}</b>\n` +
+        `👥 <b>Total Requests:</b> <code>${allReqs.length}</code>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `👇 <i>Option chunein:</i>`;
+
+      if (ctx.callbackQuery) {
+        try { await ctx.answerCallbackQuery(); } catch (_) {}
+      }
+      await ctx.reply(text, { parse_mode: "HTML", reply_markup: kb });
+    }
+
+    bot.hears([/💳 Manage Payouts/i, /Manage Payouts/i, /^\/payouts$/i], sendAdminPayoutDashboard);
+    bot.callbackQuery("admin_manage_payouts", sendAdminPayoutDashboard);
+    bot.callbackQuery("admin_back_to_menu", async (ctx) => {
+      if (!isAdmin(ctx.from.id)) return;
+      try { await ctx.answerCallbackQuery(); } catch (_) {}
+      await ctx.reply("⚙️ Admin Control Center:", { parse_mode: "HTML", reply_markup: getAdminReplyKeyboard() });
+    });
+
+    // View Pending Payouts
+    async function viewPendingPayouts(ctx) {
+      if (!isAdmin(ctx.from.id)) return ctx.answerCallbackQuery({ text: "Access Denied", show_alert: true });
+
+      const pendingReqs = Array.from(payoutRequests.values())
+        .filter((r) => r.status === "PENDING")
+        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+      if (pendingReqs.length === 0) {
+        if (ctx.callbackQuery) {
+          try { await ctx.answerCallbackQuery({ text: "Koi pending payout request nahi hai!", show_alert: true }); } catch (_) {}
+        }
+        return ctx.reply(
+          `✅ ━━━━━━━━━━━━━━━━━━\n` +
+          `📋 <b>NO PENDING PAYOUTS</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Sabhi payout requests process ho chuki hain. Koi nayi pending request nahi hai!`,
+          { parse_mode: "HTML", reply_markup: getAdminReplyKeyboard() }
+        );
+      }
+
+      if (ctx.callbackQuery) {
+        try { await ctx.answerCallbackQuery(); } catch (_) {}
+      }
+
+      await ctx.reply(
+        `📋 ━━━━━━━━━━━━━━━━━━\n` +
+        `⏳ <b>PENDING PAYOUT REQUESTS (${pendingReqs.length})</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `Neeche diye gaye requests par action lein:`,
+        { parse_mode: "HTML" }
+      );
+
+      for (const req of pendingReqs.slice(0, 10)) {
+        const u = users.get(String(req.userId));
+        const totalRefers = u ? (u.referralsCount || u.referrals || 0) : req.refersCount;
+        const dateStr = new Date(req.timestamp).toLocaleString("en-IN");
+        const bonusTag = Number(req.refersCount) >= 50 ? " (Flat ₹100 Bonus! 🎁)" : "";
+
+        const reqText =
+          `💳 <b>Request ID:</b> <code>${req.requestId}</code>\n` +
+          `👤 <b>User Name:</b> ${escapeHtml(req.userName)}\n` +
+          `🆔 <b>Telegram ID:</b> <code>${req.userId}</code>\n` +
+          `👥 <b>Total Refers:</b> ${totalRefers} (Claimed: ${req.refersCount})\n` +
+          `💵 <b>Amount:</b> <b>₹${req.amount}</b>${bonusTag}\n` +
+          `📱 <b>Payment Details:</b> <code>${escapeHtml(req.paymentDetails)}</code>\n` +
+          `📅 <b>Requested Date:</b> <code>${dateStr}</code>`;
+
+        const actionKb = new InlineKeyboard()
+          .text("✅ Approve & Paid", `payout_appr_${req.requestId}`)
+          .text("❌ Reject & Refund", `payout_rej_${req.requestId}`);
+
+        await ctx.reply(reqText, { parse_mode: "HTML", reply_markup: actionKb });
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
+
+    bot.callbackQuery("admin_view_pending_payouts", viewPendingPayouts);
+
+    // View All Payouts History
+    bot.callbackQuery("admin_view_all_payouts", async (ctx) => {
+      if (!isAdmin(ctx.from.id)) return;
+      try { await ctx.answerCallbackQuery(); } catch (_) {}
+
+      const allReqs = Array.from(payoutRequests.values())
+        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+      if (allReqs.length === 0) {
+        return ctx.reply("Abhi koi payout record nahi hai.", { parse_mode: "HTML" });
+      }
+
+      let historyText = "";
+      allReqs.slice(0, 10).forEach((r, i) => {
+        let badge = "🟡 PENDING";
+        if (r.status === "PAID" || r.status === "Completed") badge = "✅ PAID";
+        else if (r.status === "REJECTED") badge = "❌ REJECTED";
+        historyText += `${i + 1}. <code>${r.requestId}</code> | <b>${escapeHtml(r.userName)}</b> | ₹${r.amount} | ${badge}\n   UPI: <code>${escapeHtml(r.paymentDetails)}</code>\n`;
+      });
+
+      const kb = new InlineKeyboard()
+        .text("📥 Export Payouts CSV", "admin_export_payouts_csv").row()
+        .text("🔙 Manage Payouts", "admin_manage_payouts");
+
+      await ctx.reply(
+        `📜 ━━━━━━━━━━━━━━━━━━\n` +
+        `💳 <b>ALL PAYOUT REQUESTS (${allReqs.length})</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        historyText +
+        `━━━━━━━━━━━━━━━━━━`,
+        { parse_mode: "HTML", reply_markup: kb }
+      );
+    });
+
+    // Approve & Paid Handler
+    bot.callbackQuery(/^payout_appr_(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx.from.id)) return ctx.answerCallbackQuery({ text: "Access Denied", show_alert: true });
+      const reqId = ctx.match[1];
+      const req = payoutRequests.get(reqId);
+
+      if (!req) {
+        return ctx.answerCallbackQuery({ text: "Request nahi mili!", show_alert: true });
+      }
+      if (req.status === "PAID" || req.status === "Completed") {
+        return ctx.answerCallbackQuery({ text: "Yeh request pehle hi Paid ho chuki hai!", show_alert: true });
+      }
+
+      const updates = {
+        status: "PAID",
+        statusDisplay: "Completed",
+        processedAt: Date.now(),
+        processedBy: String(ctx.from.id)
+      };
+
+      await updatePayoutRequest(reqId, updates);
+      Object.assign(req, updates);
+
+      // Update user referral_cash
+      const cashStats = getUserCashStats(req.userId);
+      await updateUserReferralCash(req.userId, {
+        totalRefers: cashStats.totalRefers,
+        availableBalance: cashStats.availableCash,
+        totalWithdrawn: cashStats.paidCash
+      });
+
+      logActivity("payout_approved", `Payout ${reqId} (₹${req.amount}) approved by admin ${ctx.from.id} for user ${req.userId}`);
+      await ctx.answerCallbackQuery({ text: `✅ Payout ${reqId} Approved!`, show_alert: true });
+
+      // Direct DM to User as requested:
+      // "🎉 Aapka ₹{Amount} ka payout successfully bhej diya gaya hai! Transaction proof dekhne ke liye support se sampark karein."
+      try {
+        await ctx.api.sendMessage(
+          req.userId,
+          `🎉 ━━━━━━━━━━━━━━━━━━\n` +
+          `💰 <b>PAYOUT SUCCESSFULLY TRANSFERRED!</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🎉 Aapka <b>₹${req.amount}</b> ka payout successfully bhej diya gaya hai!\n\n` +
+          `📌 <b>Request ID:</b> <code>${req.requestId}</code>\n` +
+          `💵 <b>Amount Paid:</b> <code>₹${req.amount}</code>\n` +
+          `📱 <b>Payment Method:</b> <code>${escapeHtml(req.paymentDetails)}</code>\n` +
+          `📅 <b>Date:</b> <code>${new Date().toLocaleString("en-IN")}</code>\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Transaction proof dekhne ke liye support se sampark karein: ${SUPPORT_URL}`,
+          { parse_mode: "HTML" }
+        );
+      } catch (err) {
+        console.warn(`[Payout Approval] Could not send direct message to user ${req.userId}:`, err.message);
+      }
+
+      try {
+        await ctx.editMessageText(
+          `✅ <b>PAYOUT APPROVED & COMPLETED!</b>\n\n` +
+          `📌 <b>Request ID:</b> <code>${req.requestId}</code>\n` +
+          `👤 <b>User:</b> ${escapeHtml(req.userName)} (<code>${req.userId}</code>)\n` +
+          `💵 <b>Amount:</b> <b>₹${req.amount}</b>\n` +
+          `📱 <b>Payment Details:</b> <code>${escapeHtml(req.paymentDetails)}</code>\n` +
+          `🛡 <b>Status:</b> 🟢 PAID (User DM sent)`,
+          { parse_mode: "HTML" }
+        );
+      } catch (_) {}
+    });
+
+    // Reject & Refund Refers Handler
+    bot.callbackQuery(/^payout_rej_(.+)$/, async (ctx) => {
+      if (!isAdmin(ctx.from.id)) return ctx.answerCallbackQuery({ text: "Access Denied", show_alert: true });
+      const reqId = ctx.match[1];
+      const req = payoutRequests.get(reqId);
+
+      if (!req) {
+        return ctx.answerCallbackQuery({ text: "Request nahi mili!", show_alert: true });
+      }
+      if (req.status !== "PENDING") {
+        return ctx.answerCallbackQuery({ text: `Request already ${req.status}!`, show_alert: true });
+      }
+
+      await ctx.answerCallbackQuery();
+
+      const reasonKb = new InlineKeyboard()
+        .text("⚠️ Fake / Inactive Referrals", `payout_rejwhy_${reqId}_fake`).row()
+        .text("❌ Invalid UPI / Account", `payout_rejwhy_${reqId}_invalidupi`).row()
+        .text("🚫 Channels Left Before Verification", `payout_rejwhy_${reqId}_leftchannel`).row()
+        .text("✍️ Custom Rejection Reason", `payout_rejwhy_${reqId}_custom`).row()
+        .text("🔙 Cancel", "admin_view_pending_payouts");
+
+      await ctx.reply(
+        `❌ ━━━━━━━━━━━━━━━━━━\n` +
+        `⚠️ <b>REJECT PAYOUT REQUEST (${reqId})</b>\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `User: <b>${escapeHtml(req.userName)}</b> (<code>${req.userId}</code>)\n` +
+        `Amount: <b>₹${req.amount}</b> (${req.refersCount} Refers)\n\n` +
+        `Kripya rejection ka karan chunein (refers user ko refund ho jayenge):`,
+        { parse_mode: "HTML", reply_markup: reasonKb }
+      );
+    });
+
+    // Quick Rejection Reason Handlers
+    bot.callbackQuery(/^payout_rejwhy_(.+)_([a-z]+)$/, async (ctx) => {
+      if (!isAdmin(ctx.from.id)) return ctx.answerCallbackQuery({ text: "Access Denied", show_alert: true });
+      const reqId = ctx.match[1];
+      const reasonCode = ctx.match[2];
+      const req = payoutRequests.get(reqId);
+
+      if (!req || req.status !== "PENDING") {
+        return ctx.answerCallbackQuery({ text: "Request already processed or not found.", show_alert: true });
+      }
+
+      if (reasonCode === "custom") {
+        userStates.set(String(ctx.from.id), {
+          action: "awaiting_payout_reject_custom_reason",
+          data: { reqId }
+        });
+        await ctx.answerCallbackQuery();
+        return ctx.reply(
+          `✍️ <b>Custom Rejection Reason Bhejein:</b>\n\n` +
+          `Request ID: <code>${reqId}</code>\n` +
+          `User: ${escapeHtml(req.userName)}\n\n` +
+          `Kripya karan likhein jo user ko DM mein bhejna hai:`,
+          { parse_mode: "HTML" }
+        );
+      }
+
+      let reasonText = "Referral verification criteria not satisfied.";
+      if (reasonCode === "fake") reasonText = "Fake, inactive, or bot referral accounts detected.";
+      else if (reasonCode === "invalidupi") reasonText = "Invalid UPI ID or unreachable account details.";
+      else if (reasonCode === "leftchannel") reasonText = "Referred members left mandatory channels.";
+
+      await executePayoutRejection(ctx, req, reasonText);
+    });
+
+    async function executePayoutRejection(ctx, req, reasonText) {
+      const updates = {
+        status: "REJECTED",
+        rejectionReason: reasonText,
+        processedAt: Date.now(),
+        processedBy: String(ctx.from.id)
+      };
+
+      await updatePayoutRequest(req.requestId, updates);
+      Object.assign(req, updates);
+
+      // Refund refers back to user referral_cash
+      const cashStats = getUserCashStats(req.userId);
+      await updateUserReferralCash(req.userId, {
+        totalRefers: cashStats.totalRefers,
+        availableBalance: cashStats.availableCash,
+        totalWithdrawn: cashStats.paidCash
+      });
+
+      logActivity("payout_rejected", `Payout ${req.requestId} rejected by admin ${ctx.from.id}: ${reasonText}`);
+      if (ctx.answerCallbackQuery) {
+        try { await ctx.answerCallbackQuery({ text: "Request Rejected & Refers Refunded!", show_alert: true }); } catch (_) {}
+      }
+
+      // Alert user via DM
+      try {
+        await ctx.api.sendMessage(
+          req.userId,
+          `❌ ━━━━━━━━━━━━━━━━━━\n` +
+          `⚠️ <b>PAYOUT REQUEST REJECTED</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Aapka Payout Request reject kar diya gaya hai:\n\n` +
+          `📌 <b>Request ID:</b> <code>${req.requestId}</code>\n` +
+          `💵 <b>Amount:</b> ₹${req.amount}\n` +
+          `⚠️ <b>Karan (Reason):</b> <b>${escapeHtml(reasonText)}</b>\n\n` +
+          `🔄 <b>Refers Refunded:</b> Aapke <b>${req.refersCount} refers</b> wapas aapke available balance mein refund kar diye gaye hain!\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Kisi bhi sahayata ke liye support team se sampark karein: ${SUPPORT_URL}`,
+          { parse_mode: "HTML" }
+        );
+      } catch (err) {
+        console.warn(`[Payout Rejection] Could not send DM to user ${req.userId}:`, err.message);
+      }
+
+      await ctx.reply(
+        `❌ <b>Payout <code>${req.requestId}</code> Rejected & Refers Refunded!</b>\nUser ko reason ka DM bhej diya gaya hai.`,
+        { parse_mode: "HTML", reply_markup: getAdminReplyKeyboard() }
+      );
+    }
+
+    // Export Payouts CSV
+    async function exportPayoutsCsv(ctx) {
+      if (!isAdmin(ctx.from.id)) return ctx.reply("⛔ Access Denied.");
+
+      const allReqs = Array.from(payoutRequests.values())
+        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+      const csvHeader = "Request ID,User ID,User Name,Amount (INR),Refers Count,Payment Details,Status,Submitted At,Processed At,Rejection Reason\n";
+      const escapeCsv = (val) => `"${String(val || "").replace(/"/g, '""')}"`;
+      const csvRows = allReqs
+        .map((r) => [
+          escapeCsv(r.requestId),
+          escapeCsv(r.userId),
+          escapeCsv(r.userName),
+          r.amount || 0,
+          r.refersCount || 0,
+          escapeCsv(r.paymentDetails),
+          escapeCsv(r.status),
+          escapeCsv(new Date(r.timestamp).toISOString()),
+          escapeCsv(r.processedAt ? new Date(r.processedAt).toISOString() : "Pending"),
+          escapeCsv(r.rejectionReason || "None")
+        ].join(","))
+        .join("\n");
+
+      const csvContent = "\uFEFF" + csvHeader + csvRows;
+      const fileBuffer = Buffer.from(csvContent, "utf-8");
+      const dateStr = new Date().toISOString().split("T")[0];
+
+      if (ctx.callbackQuery) {
+        try { await ctx.answerCallbackQuery(); } catch (_) {}
+      }
+
+      await ctx.replyWithDocument(
+        new InputFile(fileBuffer, `eipl_payout_requests_${dateStr}.csv`),
+        {
+          caption:
+            `📁 ━━━━━━━━━━━━━━━━━━\n` +
+            `📊 <b>PAYOUT REQUESTS DATABASE EXPORT</b>\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `💳 <b>Total Requests:</b> <code>${allReqs.length}</code>\n` +
+            `📅 <b>Export Date:</b> <code>${new Date().toLocaleDateString("en-IN")}</code>\n` +
+            `✨ Complete history with UPI details, statuses, & rejection reasons.`,
+          parse_mode: "HTML",
+          reply_markup: getAdminReplyKeyboard()
+        }
+      );
+    }
+
+    bot.callbackQuery("admin_export_payouts_csv", exportPayoutsCsv);
+    bot.hears([/Export Payouts CSV/i, /^\/payoutscsv$/i], exportPayoutsCsv);
 
     // Back to User Menu Trigger -> Switches back to User Keyboard
     bot.hears([/🔙 Back to User Menu/i, /Back to User Menu/i], async (ctx) => {
@@ -1378,6 +2520,8 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
         targetUser.points = Math.max(0, oldPoints + amountNum);
         logActivity("admin_point_manage", `Admin ${userId} adjusted points for ${targetUserId} by ${amountNum} (Old: ${oldPoints}, New: ${targetUser.points})`);
 
+        updateUser(targetUserId, { points: targetUser.points }).catch(() => {});
+
         // Notify user
         try {
           await bot.api.sendMessage(
@@ -1407,41 +2551,7 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
       if (state.action === "awaiting_redeem_code") {
         userStates.delete(userId);
         const user = getOrCreateUser(from);
-        const codeInput = text.toUpperCase();
-
-        const codeObj = redeemCodes.get(codeInput);
-        if (!codeObj) {
-          return ctx.reply(`❌ <b>Galat Code!</b> Code <code>${escapeHtml(codeInput)}</code> exist nahi karta.`, {
-            parse_mode: "HTML",
-            reply_markup: getMainReplyKeyboard(ctx.from.id)
-          });
-        }
-        if (codeObj.usedBy.has(userId)) {
-          return ctx.reply(`⚠️ <b>Aap pehle hi yeh code redeem kar chuke hain!</b>`, {
-            parse_mode: "HTML",
-            reply_markup: getMainReplyKeyboard(ctx.from.id)
-          });
-        }
-        if (codeObj.usedBy.size >= codeObj.maxUses) {
-          return ctx.reply(`⚠️ <b>Yeh code ki maximum limit poori ho chuki hai!</b>`, {
-            parse_mode: "HTML",
-            reply_markup: getMainReplyKeyboard(ctx.from.id)
-          });
-        }
-
-        codeObj.usedBy.add(userId);
-        user.points += codeObj.points;
-        logActivity("code_redeemed", `User ${user.firstName} redeemed ${codeInput} for +${codeObj.points} pts.`);
-
-        return ctx.reply(
-          `🎉 ━━━━━━━━━━━━━━━━━━\n` +
-          `🎫 <b>CODE REDEEMED SUCCESSFULLY!</b>\n` +
-          `━━━━━━━━━━━━━━━━━━\n` +
-          `💎 <b>Reward:</b> <code>+${codeObj.points} Points</code>\n` +
-          `💰 <b>Naya Total Balance:</b> <b>${user.points} Points</b>\n` +
-          `━━━━━━━━━━━━━━━━━━`,
-          { parse_mode: "HTML", reply_markup: getMainReplyKeyboard(ctx.from.id) }
-        );
+        return processRedeemCode(ctx, text, user);
       }
 
       // 4. ADD FORCE CHANNEL
@@ -1510,13 +2620,22 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
         const cPts = parseInt(parts[1], 10) || 5;
         const cMax = parseInt(parts[2], 10) || 100;
 
-        redeemCodes.set(cCode, {
+        const promoPayload = {
           code: cCode,
           points: cPts,
           maxUses: cMax,
-          usedBy: new Set(),
-          createdAt: new Date().toISOString()
+          active: true,
+          description: "Admin Created Promo Code",
+          createdAt: new Date().toISOString(),
+          usedBy: {}
+        };
+
+        redeemCodes.set(cCode, {
+          ...promoPayload,
+          usedBy: new Set()
         });
+
+        savePromoCode(cCode, promoPayload).catch(() => {});
         logActivity("admin_create_code", `Created code: ${cCode}`);
         return ctx.reply(
           `✅ ━━━━━━━━━━━━━━━━━━\n` +
@@ -1524,7 +2643,8 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
           `━━━━━━━━━━━━━━━━━━\n` +
           `🔹 <b>Code:</b> <code>${escapeHtml(cCode)}</code>\n` +
           `🔹 <b>Points:</b> <code>+${cPts}</code>\n` +
-          `🔹 <b>Max Uses:</b> <code>${cMax}</code>`,
+          `🔹 <b>Max Uses:</b> <code>${cMax}</code>\n` +
+          `💾 <i>Saved to Firebase Realtime Database!</i>`,
           { parse_mode: "HTML", reply_markup: getAdminReplyKeyboard() }
         );
       }
@@ -1543,24 +2663,130 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
         }
         return ctx.reply("❌ Invalid numeric User ID.", { parse_mode: "HTML", reply_markup: getAdminReplyKeyboard() });
       }
+
+      // 7. CASH PAYOUT PAYMENT DETAILS
+      if (state.action === "awaiting_payout_payment_details") {
+        userStates.delete(userId);
+        const user = getOrCreateUser(from);
+        const availableRefers = state.data?.availableRefers || 10;
+        const payoutAmount = state.data?.amount || 10;
+
+        if (!text || text.length < 3 || text.startsWith("/")) {
+          return ctx.reply("⚠️ <b>Invalid Payment Method:</b> Kripya valid UPI ID ya mobile number enter karein (e.g. <code>yourname@upi</code> ya <code>9876543210</code>).", {
+            parse_mode: "HTML",
+            reply_markup: getMainReplyKeyboard(userId)
+          });
+        }
+
+        // Generate clean Request ID
+        const requestId = `PAY-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+        const newReq = {
+          requestId,
+          userId: String(user.id),
+          userName: `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.username || "User",
+          amount: payoutAmount,
+          refersCount: availableRefers,
+          paymentDetails: text.trim(),
+          status: "PENDING",
+          timestamp: Date.now(),
+          createdAt: new Date().toISOString()
+        };
+
+        payoutRequests.set(requestId, newReq);
+        await savePayoutRequest(requestId, newReq);
+
+        // Update user referral_cash in Firebase
+        const stats = getUserCashStats(user.id);
+        await updateUserReferralCash(user.id, {
+          totalRefers: stats.totalRefers,
+          availableBalance: stats.availableCash,
+          totalWithdrawn: stats.paidCash
+        });
+
+        logActivity("payout_request_created", `User ${user.id} requested payout ${requestId} for ₹${payoutAmount} (${availableRefers} refers) via ${text.trim()}`);
+
+        // Notify Admins
+        for (const adminId of admins) {
+          try {
+            const adminKb = new InlineKeyboard()
+              .text("✅ Approve & Paid", `payout_appr_${requestId}`)
+              .text("❌ Reject & Refund", `payout_rej_${requestId}`);
+
+            await bot.api.sendMessage(
+              adminId,
+              `🔔 ━━━━━━━━━━━━━━━━━━\n` +
+              `💳 <b>NEW CASH PAYOUT REQUEST!</b>\n` +
+              `━━━━━━━━━━━━━━━━━━\n` +
+              `Nayi cash payout request aayi hai:\n\n` +
+              `📌 <b>Request ID:</b> <code>${requestId}</code>\n` +
+              `👤 <b>User:</b> ${escapeHtml(newReq.userName)} (<code>${user.id}</code>)\n` +
+              `💵 <b>Amount:</b> <b>₹${payoutAmount}</b>\n` +
+              `👥 <b>Refers Count:</b> <b>${availableRefers} Refers</b>\n` +
+              `📱 <b>Payment Method:</b> <code>${escapeHtml(newReq.paymentDetails)}</code>\n` +
+              `📅 <b>Time:</b> <code>${new Date().toLocaleTimeString("en-IN")}</code>\n\n` +
+              `━━━━━━━━━━━━━━━━━━\n` +
+              `👇 <i>Quick Action:</i>`,
+              { parse_mode: "HTML", reply_markup: adminKb }
+            );
+          } catch (_) {}
+        }
+
+        return ctx.reply(
+          `🎉 ━━━━━━━━━━━━━━━━━━\n` +
+          `✅ <b>PAYOUT REQUEST CONFIRMED!</b>\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `Aapki payout request successfully submit ho chuki hai:\n\n` +
+          `📌 <b>Request ID:</b> <code>${requestId}</code>\n` +
+          `💵 <b>Payout Amount:</b> <b>₹${payoutAmount}</b>\n` +
+          `👥 <b>Refers Redeemed:</b> <b>${availableRefers} Refers</b>\n` +
+          `📱 <b>Payment Method:</b> <code>${escapeHtml(newReq.paymentDetails)}</code>\n` +
+          `⏳ <b>Status:</b> <b>🟡 PENDING (Under Review)</b>\n` +
+          `📅 <b>Date:</b> <code>${new Date().toLocaleString("en-IN")}</code>\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `⏱ <i>Admin team 1-12 ghanton ke andar aapke account mein paise transfer kar degi. Status dekhne ke liye <b>📜 Payout History</b> check karein.</i>`,
+          { parse_mode: "HTML", reply_markup: getMainReplyKeyboard(userId) }
+        );
+      }
+
+      // 8. ADMIN CUSTOM REJECTION REASON
+      if (state.action === "awaiting_payout_reject_custom_reason" && isAdmin(userId)) {
+        userStates.delete(userId);
+        const reqId = state.data?.reqId;
+        const req = payoutRequests.get(reqId);
+        if (!req) {
+          return ctx.reply("❌ Payout request not found.", { reply_markup: getAdminReplyKeyboard() });
+        }
+        return executePayoutRejection(ctx, req, text.trim());
+      }
     });
 
-    // Start Polling Safely
-    bot
-      .start({
-        onStart(info) {
-          botStatus.isPolling = true;
-          botStatus.username = info.username;
-          botStatus.error = null;
-          console.log(`[Telegram Bot] Polling started live as @${info.username} (ID: ${info.id})`);
-          logActivity("bot_online", `@${info.username} is online and polling updates.`);
+    // Start Polling Safely with Single Polling Guard
+    (async () => {
+      try {
+        // Clear any existing webhook to ensure clean polling without conflict
+        await bot.api.deleteWebhook({ drop_pending_updates: false }).catch(() => {});
+
+        await bot.start({
+          onStart(info) {
+            botStatus.isPolling = true;
+            botStatus.username = info.username;
+            botStatus.error = null;
+            console.log(`[Telegram Bot] Polling started live as @${info.username} (ID: ${info.id})`);
+            logActivity("bot_online", `@${info.username} is online and polling updates.`);
+          }
+        });
+      } catch (err) {
+        if (err.error_code === 409 || String(err.message || "").includes("409: Conflict")) {
+          console.warn("[Telegram Bot] Another polling instance detected (409 Conflict). Single polling guard active; ensuring no duplicate polling loop lingers.");
+          botStatus.isPolling = false;
+          botStatus.error = "Conflict: another polling instance is running";
+        } else {
+          console.error("[Telegram Bot Polling Error]:", err.message);
+          botStatus.isPolling = false;
+          botStatus.error = err.message;
         }
-      })
-      .catch((err) => {
-        console.error("[Telegram Bot Polling Error]:", err.message);
-        botStatus.isPolling = false;
-        botStatus.error = err.message;
-      });
+      }
+    })();
   } catch (err) {
     console.error("[Telegram Initialization Error]:", err.message);
     botStatus.error = err.message;
@@ -1572,6 +2798,24 @@ if (BOT_TOKEN && BOT_TOKEN.length > 10 && !BOT_TOKEN.includes("MY_BOT_TOKEN")) {
   console.log("🌐 Keep-Alive Health Server is running on port " + PORT);
   console.log("======================================================");
 }
+
+// Clean process shutdown to ensure no zombie polling instances linger
+let isShuttingDown = false;
+async function cleanExit(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[Process] Received ${signal}. Stopping bot safely...`);
+  if (bot && botStatus.isPolling) {
+    try {
+      await bot.stop();
+      console.log("[Telegram Bot] Polling stopped successfully.");
+    } catch (_) {}
+    botStatus.isPolling = false;
+  }
+  process.exit(0);
+}
+process.once("SIGINT", () => cleanExit("SIGINT"));
+process.once("SIGTERM", () => cleanExit("SIGTERM"));
 
 // ==========================================
 // 7. LIGHTWEIGHT HTTP HEALTH & DASHBOARD
@@ -1597,6 +2841,8 @@ const server = http.createServer((req, res) => {
         bot: botStatus.isPolling ? "online" : "waiting_token",
         username: botStatus.username || null,
         usersCount: users.size,
+        firebaseConnected: isFirebaseReady(),
+        firebaseDatabaseUrl: DATABASE_URL,
         withdrawalsEnabled,
         uptime: process.uptime()
       })
@@ -1614,6 +2860,10 @@ const server = http.createServer((req, res) => {
         admins: Array.from(admins),
         supportLink: SUPPORT_URL,
         usersCount: users.size,
+        payoutsCount: payoutRequests.size,
+        pendingPayoutsCount: Array.from(payoutRequests.values()).filter((r) => r.status === "PENDING").length,
+        firebaseConnected: isFirebaseReady(),
+        firebaseDatabaseUrl: DATABASE_URL,
         channelsCount: dynamicChannels.length,
         codesCount: redeemCodes.size,
         withdrawalsEnabled,
@@ -1640,6 +2890,7 @@ const server = http.createServer((req, res) => {
         .badge { display: inline-block; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 0.8rem; }
         .badge-green { background: #064e3b; color: #34d399; border: 1px solid #059669; }
         .badge-amber { background: #451a03; color: #fbbf24; border: 1px solid #d97706; }
+        .badge-blue { background: #0c4a6e; color: #38bdf8; border: 1px solid #0284c7; }
         
         .feature-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin: 1.2rem 0; }
         .feature-card { background: #0e172a; border: 1px solid #1e293b; border-radius: 12px; padding: 0.75rem; font-size: 0.82rem; }
@@ -1654,10 +2905,10 @@ const server = http.createServer((req, res) => {
         .btn-success { background: #16a34a; border: 1px solid #22c55e; }
         .btn-danger { background: #dc2626; border: 1px solid #ef4444; color: #fff; }
 
-        .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; margin: 1rem 0; }
+        .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; margin: 1rem 0; }
         .stat-card { background: #0a101d; border: 1px solid #1e293b; border-radius: 12px; padding: 0.75rem; text-align: center; }
-        .stat-num { font-size: 1.3rem; font-weight: bold; color: #f59e0b; }
-        .stat-label { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; }
+        .stat-num { font-size: 1.2rem; font-weight: bold; color: #f59e0b; }
+        .stat-label { font-size: 0.68rem; color: #94a3b8; text-transform: uppercase; }
         .section-title { font-size: 0.9rem; font-weight: bold; margin-top: 1.25rem; margin-bottom: 0.5rem; color: #cbd5e1; }
         ul { padding-left: 1.2rem; margin: 0.5rem 0; }
         li { font-size: 0.85rem; color: #94a3b8; margin-bottom: 0.3rem; }
@@ -1669,14 +2920,18 @@ const server = http.createServer((req, res) => {
     <body>
       <div class="container">
         <h1>🏏 eIPL Official Bot</h1>
-        <p style="margin: 0 0 1rem 0; font-size: 0.88rem; color: #94a3b8;">Vibrant Colors • Spin & Win • Top 10 Leaderboard • Hot Offers • Admin Point Controls</p>
+        <p style="margin: 0 0 1rem 0; font-size: 0.88rem; color: #94a3b8;">Firebase RTDB Persistence • Cash Refer & Payout System • Spin & Win</p>
         
-        <div>
-          Status: 
+        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem;">
           ${
             botStatus.isPolling
               ? `<span class="badge badge-green">🟢 Live Polling (@${botStatus.username})</span>`
-              : `<span class="badge badge-amber">🟡 Standby (Waiting for BOT_TOKEN)</span>`
+              : `<span class="badge badge-amber">🟡 Bot: Standby (Waiting for BOT_TOKEN)</span>`
+          }
+          ${
+            isFirebaseReady()
+              ? `<span class="badge badge-green">🔥 Firebase RTDB: Connected</span>`
+              : `<span class="badge badge-blue">💾 Memory Sync: 31 Restored Users Active</span>`
           }
         </div>
 
@@ -1693,20 +2948,20 @@ const server = http.createServer((req, res) => {
 
         <div class="feature-grid">
           <div class="feature-card">
+            <div class="feature-title">👥 Cash Refer & Payout</div>
+            <div>₹ Cash dashboard, UPI withdrawals, ₹100 flat bonus for 50+ refers.</div>
+          </div>
+          <div class="feature-card">
+            <div class="feature-title">💳 Admin Payout Controls</div>
+            <div>Review, 1-click Approve & DM, Reject & Refund, CSV Export.</div>
+          </div>
+          <div class="feature-card">
             <div class="feature-title">🎰 Spin & Win Wheel</div>
             <div>24h cooldown, animated reels, random +1 to 10 points reward.</div>
           </div>
           <div class="feature-card">
-            <div class="feature-title">🏆 Top 10 Leaderboard</div>
-            <div>Dynamic rankings by points & referrals + user position.</div>
-          </div>
-          <div class="feature-card">
-            <div class="feature-title">🔥 Hot Referral Offers</div>
-            <div>10 refs = ₹10 cash bonus | 50 refs = ₹100 cash bonus.</div>
-          </div>
-          <div class="feature-card">
-            <div class="feature-title">💳 Admin Point Management</div>
-            <div>Add or deduct points for any user ID directly in Telegram.</div>
+            <div class="feature-title">🔥 Firebase RTDB Persistence</div>
+            <div>All users, promo codes, & payout requests synced real-time.</div>
           </div>
         </div>
 
@@ -1717,6 +2972,9 @@ const server = http.createServer((req, res) => {
             <span style="color: ${withdrawalsEnabled ? '#34d399' : '#f87171'};">
               Redemptions: ${withdrawalsEnabled ? 'ON' : 'PAUSED'}
             </span>
+          </div>
+          <div class="kb-row single">
+            <div class="kb-btn btn-success">👥 Refer & Earn (₹ Cash)</div>
           </div>
           <div class="kb-row">
             <div class="kb-btn btn-primary">🎰 Spin & Win</div>
@@ -1751,6 +3009,10 @@ const server = http.createServer((req, res) => {
             <div class="stat-label">Users</div>
           </div>
           <div class="stat-card">
+            <div class="stat-num">${Array.from(payoutRequests.values()).filter((r) => r.status === "PENDING").length}</div>
+            <div class="stat-label">Pending ₹</div>
+          </div>
+          <div class="stat-card">
             <div class="stat-num">${dynamicChannels.length}</div>
             <div class="stat-label">Channels</div>
           </div>
@@ -1760,8 +3022,47 @@ const server = http.createServer((req, res) => {
           </div>
         </div>
 
-        <div class="section-title">⚡ Environment Secrets:</div>
+        <div class="section-title">💳 Recent Payout Requests (${payoutRequests.size}):</div>
+        <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; padding: 6px 12px; margin-bottom: 20px;">
+          ${
+            payoutRequests.size === 0
+              ? '<div style="color: #64748b; font-size: 13px; padding: 8px;">No payout requests yet. Users can request payout via 👥 Refer & Earn (₹ Cash).</div>'
+              : Array.from(payoutRequests.values()).slice(-5).reverse().map(r => `
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; border-bottom: 1px solid rgba(255, 255, 255, 0.06);">
+                  <div>
+                    <code style="color: #38bdf8; font-size: 13px; font-weight: bold;">${escapeHtml(r.requestId)}</code>
+                    <span style="color: #cbd5e1; font-size: 13px; margin-left: 6px;">${escapeHtml(r.userName)}</span>
+                    <div style="color: #64748b; font-size: 11px;">UPI: ${escapeHtml(r.paymentDetails)}</div>
+                  </div>
+                  <div style="display: flex; align-items: center; gap: 8px;">
+                    <span style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 12px;">₹${r.amount}</span>
+                    <span style="padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; ${r.status === 'PAID' ? 'background: #064e3b; color: #34d399;' : r.status === 'REJECTED' ? 'background: #450a0a; color: #f87171;' : 'background: #451a03; color: #fbbf24;'}">${r.status}</span>
+                  </div>
+                </div>
+              `).join('')
+          }
+        </div>
+
+        <div class="section-title">🎁 Active Promo / Gift Codes (${redeemCodes.size}):</div>
+        <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; padding: 6px 12px; margin-bottom: 20px;">
+          ${Array.from(redeemCodes.values()).map(c => `
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; border-bottom: 1px solid rgba(255, 255, 255, 0.06);">
+              <div>
+                <code style="color: #60a5fa; font-size: 14px; font-weight: bold;">${escapeHtml(c.code)}</code>
+                <span style="color: #94a3b8; font-size: 12px; margin-left: 6px;">(${escapeHtml(c.description || 'VIP Gift')})</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="background: rgba(52, 211, 153, 0.2); color: #34d399; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 12px;">+${c.points} Pts</span>
+                <span style="color: #64748b; font-size: 11px;">${c.usedBy ? (c.usedBy.size !== undefined ? c.usedBy.size : Object.keys(c.usedBy).length) : 0}/${c.maxUses || '∞'} claimed</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+
+        <div class="section-title">⚡ Environment & Database:</div>
         <ul>
+          <li><strong>Firebase RTDB:</strong> <code>${escapeHtml(DATABASE_URL)}</code></li>
+          <li><strong>User Records:</strong> ${users.size} loaded (${SEED_USERS ? Object.keys(SEED_USERS).length : 0} from CSV restore)</li>
           <li><strong>BOT_TOKEN:</strong> ${BOT_TOKEN ? "Configured (" + BOT_TOKEN.slice(0, 7) + "...)" : "Not configured yet"}</li>
           <li><strong>ADMIN_ID_1:</strong> ${ADMIN_ID_1}</li>
           <li><strong>ADMIN_ID_2:</strong> ${ADMIN_ID_2}</li>
